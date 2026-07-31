@@ -203,12 +203,32 @@ def parse_date_input(text):
     text = text.strip()
     if not text:
         return None
-    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
-        try:
-            return datetime.datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-    return None
+    try:
+        return datetime.datetime.strptime(text, "%Y/%m/%d").date()
+    except ValueError:
+        return None
+
+
+def parse_date_range_input(text):
+    text = text.strip()
+    if not text:
+        return None, None
+
+    for sep in ("~", "〜", "-"):
+        if sep in text:
+            start_str, _, end_str = text.partition(sep)
+            start = parse_date_input(start_str)
+            end = parse_date_input(end_str)
+            if start and end:
+                if start > end:
+                    start, end = end, start
+                return start, end
+            return None, None
+
+    single = parse_date_input(text)
+    if single:
+        return single, single
+    return None, None
 
 
 def _entry_jst_date(entry):
@@ -231,19 +251,24 @@ def process_entry(entry):
     }
 
 
-def fetch_news(theme, count, target_date=None):
+def fetch_news(theme, count, start_date=None, end_date=None):
     query_text = theme
-    if target_date:
-        next_day = target_date + datetime.timedelta(days=1)
-        query_text = f"{theme} after:{target_date.isoformat()} before:{next_day.isoformat()}"
+    if start_date and end_date:
+        next_day = end_date + datetime.timedelta(days=1)
+        query_text = f"{theme} after:{start_date.isoformat()} before:{next_day.isoformat()}"
 
     query = urllib.parse.quote(query_text)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
     feed = feedparser.parse(feed_url)
 
     entries = feed.entries
-    if target_date:
-        entries = [e for e in entries if _entry_jst_date(e) == target_date]
+    if start_date and end_date:
+        filtered = []
+        for e in entries:
+            entry_date = _entry_jst_date(e)
+            if entry_date and start_date <= entry_date <= end_date:
+                filtered.append(e)
+        entries = filtered
     entries = entries[:count]
     total = len(entries)
     if total == 0:
@@ -304,21 +329,30 @@ def main():
         print("テーマが入力されていません。")
         return
 
-    date_input = input("対象の日付を指定する場合は入力してください(例: 2026/7/30、空欄で指定なし): ").strip()
-    target_date = None
+    date_input = input(
+        "対象の日付を指定する場合は入力してください"
+        "(例: 2026/7/30、範囲指定は 2026/7/28-2026/7/30、空欄で指定なし): "
+    ).strip()
+    start_date = end_date = None
     if date_input:
-        target_date = parse_date_input(date_input)
-        if target_date is None:
-            print("日付の形式が正しくありません(例: 2026/7/30)。日付指定なしで続けます。")
+        start_date, end_date = parse_date_range_input(date_input)
+        if start_date is None:
+            print("日付の形式が正しくありません(例: 2026/7/30 または 2026/7/28-2026/7/30)。日付指定なしで続けます。")
 
     print(f"「{theme}」に関するニュースを収集中...(記事の要約も取得するため、少し時間がかかります)")
-    articles = fetch_news(theme, NEWS_COUNT, target_date=target_date)
+    articles = fetch_news(theme, NEWS_COUNT, start_date=start_date, end_date=end_date)
 
     if not articles:
         print("ニュースが見つかりませんでした。")
         return
 
-    date_label = f"({target_date.strftime('%Y/%m/%d')})" if target_date else ""
+    if start_date and end_date:
+        if start_date == end_date:
+            date_label = f"({start_date.strftime('%Y/%m/%d')})"
+        else:
+            date_label = f"({start_date.strftime('%Y/%m/%d')}〜{end_date.strftime('%Y/%m/%d')})"
+    else:
+        date_label = ""
     body = build_email_body(theme, articles, date_label=date_label)
     subject = f"【ニュース収集】{theme}{date_label} ({len(articles)}件)"
 
