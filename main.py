@@ -117,6 +117,101 @@ def resolve_article_url(google_link):
         return google_link
 
 
+def _char_ngrams(text, n=2):
+    if len(text) < n:
+        return {text}
+    return {text[i:i + n] for i in range(len(text) - n + 1)}
+
+
+def _sentence_similarity(a, b):
+    set_a, set_b = _char_ngrams(a), _char_ngrams(b)
+    if not set_a or not set_b:
+        return 0.0
+    overlap = len(set_a & set_b)
+    if overlap == 0:
+        return 0.0
+    return overlap / (len(set_a) + len(set_b))
+
+
+def _rank_sentences(sentences, iterations=20, damping=0.85):
+    n = len(sentences)
+    sim = [[0.0] * n for _ in range(n)]
+    for i in range(n):
+        for j in range(n):
+            if i != j:
+                sim[i][j] = _sentence_similarity(sentences[i], sentences[j])
+
+    row_sums = [sum(sim[i]) or 1.0 for i in range(n)]
+    scores = [1.0] * n
+    for _ in range(iterations):
+        new_scores = []
+        for i in range(n):
+            incoming = sum(sim[j][i] / row_sums[j] * scores[j] for j in range(n) if j != i)
+            new_scores.append((1 - damping) + damping * incoming)
+        scores = new_scores
+    return scores
+
+
+def summarize_text(text, max_sentences=3, max_chars=300):
+    sentences = [s.strip() for s in re.split(r"(?<=[。！?])", text.strip()) if s.strip()]
+    if not sentences:
+        return None
+
+    if len(sentences) <= max_sentences:
+        summary = "".join(sentences)
+    else:
+        scores = _rank_sentences(sentences)
+        top_indices = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:max_sentences]
+        top_indices.sort()
+        summary = "".join(sentences[i] for i in top_indices)
+
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rstrip() + "…"
+    return summary or None
+
+
+BOILERPLATE_MARKERS = [
+    "RECOMMEND",
+    "あなたにおすすめ",
+    "PICK UP",
+    "おすすめ記事",
+    "おすすめコンテンツ",
+    "関連記事",
+    "この記事もおすすめ",
+    "こちらの記事も",
+    "SNSでシェア",
+    "あわせて読みたい",
+    "資料請求",
+    "商談予約",
+    "ログイン・新規登録",
+    "掲載企業ログイン",
+]
+
+PAYWALL_MARKERS = [
+    "有料会員限定",
+    "有料登録",
+    "会員限定記事",
+    "この記事は会員限定",
+    "この記事は有料",
+    "続きを読むには",
+    "ログインが必要です",
+    "この記事は会員向け",
+]
+
+
+def _strip_boilerplate(text, max_chars=3000):
+    text = text[:max_chars]
+    cut_positions = [pos for pos in (text.find(m) for m in BOILERPLATE_MARKERS) if pos != -1]
+    if cut_positions:
+        text = text[:min(cut_positions)]
+    return text
+
+
+def _looks_paywalled(text, search_chars=1000):
+    head = text[:search_chars]
+    return any(marker in head for marker in PAYWALL_MARKERS)
+
+
 def extract_summary(article_url, max_sentences=3, max_chars=300):
     try:
         resp = requests.get(article_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
@@ -128,11 +223,14 @@ def extract_summary(article_url, max_sentences=3, max_chars=300):
     if not text:
         return None
 
-    sentences = [s.strip() for s in re.split(r"(?<=[。！?])", text.strip()) if s.strip()]
-    summary = "".join(sentences[:max_sentences])
-    if len(summary) > max_chars:
-        summary = summary[:max_chars].rstrip() + "…"
-    return summary or None
+    if _looks_paywalled(text):
+        return None
+
+    text = _strip_boilerplate(text)
+    if not text.strip():
+        return None
+
+    return summarize_text(text, max_sentences=max_sentences, max_chars=max_chars)
 
 
 def format_date(entry):
