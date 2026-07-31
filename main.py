@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import re
@@ -117,54 +118,12 @@ def resolve_article_url(google_link):
         return google_link
 
 
-def _char_ngrams(text, n=2):
-    if len(text) < n:
-        return {text}
-    return {text[i:i + n] for i in range(len(text) - n + 1)}
-
-
-def _sentence_similarity(a, b):
-    set_a, set_b = _char_ngrams(a), _char_ngrams(b)
-    if not set_a or not set_b:
-        return 0.0
-    overlap = len(set_a & set_b)
-    if overlap == 0:
-        return 0.0
-    return overlap / (len(set_a) + len(set_b))
-
-
-def _rank_sentences(sentences, iterations=20, damping=0.85):
-    n = len(sentences)
-    sim = [[0.0] * n for _ in range(n)]
-    for i in range(n):
-        for j in range(n):
-            if i != j:
-                sim[i][j] = _sentence_similarity(sentences[i], sentences[j])
-
-    row_sums = [sum(sim[i]) or 1.0 for i in range(n)]
-    scores = [1.0] * n
-    for _ in range(iterations):
-        new_scores = []
-        for i in range(n):
-            incoming = sum(sim[j][i] / row_sums[j] * scores[j] for j in range(n) if j != i)
-            new_scores.append((1 - damping) + damping * incoming)
-        scores = new_scores
-    return scores
-
-
 def summarize_text(text, max_sentences=3, max_chars=300):
     sentences = [s.strip() for s in re.split(r"(?<=[。！?])", text.strip()) if s.strip()]
     if not sentences:
         return None
 
-    if len(sentences) <= max_sentences:
-        summary = "".join(sentences)
-    else:
-        scores = _rank_sentences(sentences)
-        top_indices = sorted(range(len(sentences)), key=lambda i: scores[i], reverse=True)[:max_sentences]
-        top_indices.sort()
-        summary = "".join(sentences[i] for i in top_indices)
-
+    summary = "".join(sentences[:max_sentences])
     if len(summary) > max_chars:
         summary = summary[:max_chars].rstrip() + "…"
     return summary or None
@@ -219,7 +178,7 @@ def extract_summary(article_url, max_sentences=3, max_chars=300):
     except requests.exceptions.RequestException:
         return None
 
-    text = trafilatura.extract(resp.text, url=article_url)
+    text = trafilatura.extract(resp.content, url=article_url)
     if not text:
         return None
 
@@ -240,6 +199,26 @@ def format_date(entry):
     return ""
 
 
+def parse_date_input(text):
+    text = text.strip()
+    if not text:
+        return None
+    for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _entry_jst_date(entry):
+    parsed = entry.get("published_parsed")
+    if not parsed:
+        return None
+    utc_dt = datetime.datetime(*parsed[:6], tzinfo=datetime.timezone.utc)
+    return (utc_dt + datetime.timedelta(hours=9)).date()
+
+
 def process_entry(entry):
     article_url = resolve_article_url(entry.link)
     summary = extract_summary(article_url)
@@ -252,11 +231,20 @@ def process_entry(entry):
     }
 
 
-def fetch_news(theme, count):
-    query = urllib.parse.quote(theme)
+def fetch_news(theme, count, target_date=None):
+    query_text = theme
+    if target_date:
+        next_day = target_date + datetime.timedelta(days=1)
+        query_text = f"{theme} after:{target_date.isoformat()} before:{next_day.isoformat()}"
+
+    query = urllib.parse.quote(query_text)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
     feed = feedparser.parse(feed_url)
-    entries = feed.entries[:count]
+
+    entries = feed.entries
+    if target_date:
+        entries = [e for e in entries if _entry_jst_date(e) == target_date]
+    entries = entries[:count]
     total = len(entries)
     if total == 0:
         return []
@@ -274,8 +262,8 @@ def fetch_news(theme, count):
     return articles
 
 
-def build_email_body(theme, articles):
-    lines = [f"テーマ「{theme}」に関するニュース ({len(articles)}件)", ""]
+def build_email_body(theme, articles, date_label=""):
+    lines = [f"テーマ「{theme}」{date_label}に関するニュース ({len(articles)}件)", ""]
     for article in articles:
         lines.append(f"●{article['title']}")
         meta = "　".join(x for x in [article["date"], article["source"]] if x)
@@ -316,15 +304,23 @@ def main():
         print("テーマが入力されていません。")
         return
 
+    date_input = input("対象の日付を指定する場合は入力してください(例: 2026/7/30、空欄で指定なし): ").strip()
+    target_date = None
+    if date_input:
+        target_date = parse_date_input(date_input)
+        if target_date is None:
+            print("日付の形式が正しくありません(例: 2026/7/30)。日付指定なしで続けます。")
+
     print(f"「{theme}」に関するニュースを収集中...(記事の要約も取得するため、少し時間がかかります)")
-    articles = fetch_news(theme, NEWS_COUNT)
+    articles = fetch_news(theme, NEWS_COUNT, target_date=target_date)
 
     if not articles:
         print("ニュースが見つかりませんでした。")
         return
 
-    body = build_email_body(theme, articles)
-    subject = f"【ニュース収集】{theme} ({len(articles)}件)"
+    date_label = f"({target_date.strftime('%Y/%m/%d')})" if target_date else ""
+    body = build_email_body(theme, articles, date_label=date_label)
+    subject = f"【ニュース収集】{theme}{date_label} ({len(articles)}件)"
 
     try:
         send_email(gmail_address, gmail_app_password, to_email, subject, body)
