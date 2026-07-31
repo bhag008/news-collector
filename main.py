@@ -7,35 +7,37 @@ from email.mime.text import MIMEText
 import feedparser
 from dotenv import load_dotenv
 
+NEWS_COUNT = 30
 
-def get_base_dir():
+
+def get_bundle_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_exe_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
-CONFIG_PATH = os.path.join(get_base_dir(), ".env")
+SENDER_CONFIG_PATH = os.path.join(get_bundle_dir(), "sender.env")
+CONFIG_PATH = os.path.join(get_exe_dir(), ".env")
 
 
 def run_setup_wizard():
     print("=" * 50)
     print("初回起動のため、設定を行います。")
-    print("Gmailの「アプリパスワード」が必要です。")
-    print("お持ちでない場合は下記URLから発行してください。")
-    print("https://myaccount.google.com/apppasswords")
     print("=" * 50)
     print()
 
-    gmail_address = input("あなたのGmailアドレス: ").strip()
-    gmail_app_password = input("Gmailのアプリパスワード(16桁): ").strip()
-    to_email = input("ニュースの送信先メールアドレス(空欄なら自分宛て): ").strip() or gmail_address
-    news_count = input("収集する件数(空欄なら30件): ").strip() or "30"
+    to_email = ""
+    while not to_email:
+        to_email = input("ニュースを届けたいメールアドレス: ").strip()
 
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        f.write(f"GMAIL_ADDRESS={gmail_address}\n")
-        f.write(f"GMAIL_APP_PASSWORD={gmail_app_password}\n")
         f.write(f"TO_EMAIL={to_email}\n")
-        f.write(f"NEWS_COUNT={news_count}\n")
 
     print()
     print("設定を保存しました。設定をやり直したい場合は、このexeと同じ場所にある")
@@ -70,14 +72,15 @@ def send_email(gmail_address, gmail_app_password, to_email, subject, body):
 
 
 def main():
+    load_dotenv(SENDER_CONFIG_PATH)
+    gmail_address = os.environ["GMAIL_ADDRESS"]
+    gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
+
     if not os.path.exists(CONFIG_PATH):
         run_setup_wizard()
 
     load_dotenv(CONFIG_PATH)
-    gmail_address = os.environ["GMAIL_ADDRESS"]
-    gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
     to_email = os.environ["TO_EMAIL"]
-    news_count = int(os.environ.get("NEWS_COUNT", "30"))
 
     theme = input("収集したいニュースのテーマを入力してください: ").strip()
     if not theme:
@@ -85,7 +88,7 @@ def main():
         return
 
     print(f"「{theme}」に関するニュースを収集中...")
-    articles = fetch_news(theme, news_count)
+    articles = fetch_news(theme, NEWS_COUNT)
 
     if not articles:
         print("ニュースが見つかりませんでした。")
@@ -98,8 +101,7 @@ def main():
         send_email(gmail_address, gmail_app_password, to_email, subject, body)
     except smtplib.SMTPAuthenticationError:
         print()
-        print("メール送信に失敗しました。Gmailアドレスかアプリパスワードが間違っている可能性があります。")
-        print(f"設定をやり直す場合は {CONFIG_PATH} を削除してから再実行してください。")
+        print("メール送信に失敗しました。作成者に連絡してください。")
         return
 
     print(f"{len(articles)}件のニュースを {to_email} に送信しました。")
