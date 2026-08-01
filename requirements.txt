@@ -2,4 +2,5 @@ anthropic
 feedparser
 python-dotenv
 requests
+tkcalendar
 trafilatura

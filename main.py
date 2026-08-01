@@ -1,12 +1,16 @@
 import datetime
 import json
 import os
+import queue
 import re
 import smtplib
 import sys
+import threading
+import tkinter as tk
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
+from tkinter import messagebox, ttk
 from urllib.parse import quote, urlparse
 
 import anthropic
@@ -14,6 +18,7 @@ import feedparser
 import requests
 import trafilatura
 from dotenv import load_dotenv
+from tkcalendar import DateEntry
 
 NEWS_COUNT = 30
 REQUEST_TIMEOUT = 10
@@ -39,25 +44,6 @@ def get_exe_dir():
 
 SENDER_CONFIG_PATH = os.path.join(get_bundle_dir(), "sender.env")
 CONFIG_PATH = os.path.join(get_exe_dir(), ".env")
-
-
-def run_setup_wizard():
-    print("=" * 50)
-    print("初回起動のため、設定を行います。")
-    print("=" * 50)
-    print()
-
-    to_email = ""
-    while not to_email:
-        to_email = input("ニュースを届けたいメールアドレス: ").strip()
-
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        f.write(f"TO_EMAIL={to_email}\n")
-
-    print()
-    print("設定を保存しました。設定をやり直したい場合は、このexeと同じ場所にある")
-    print(".env ファイルを削除してから再実行してください。")
-    print()
 
 
 def _get_base64_str(google_link):
@@ -253,38 +239,6 @@ def format_date(entry):
     return ""
 
 
-def parse_date_input(text):
-    text = text.strip()
-    if not text:
-        return None
-    try:
-        return datetime.datetime.strptime(text, "%Y/%m/%d").date()
-    except ValueError:
-        return None
-
-
-def parse_date_range_input(text):
-    text = text.strip()
-    if not text:
-        return None, None
-
-    for sep in ("~", "〜", "-"):
-        if sep in text:
-            start_str, _, end_str = text.partition(sep)
-            start = parse_date_input(start_str)
-            end = parse_date_input(end_str)
-            if start and end:
-                if start > end:
-                    start, end = end, start
-                return start, end
-            return None, None
-
-    single = parse_date_input(text)
-    if single:
-        return single, single
-    return None, None
-
-
 def _entry_jst_date(entry):
     parsed = entry.get("published_parsed")
     if not parsed:
@@ -371,7 +325,7 @@ def build_theme_query(theme):
     return "(" + " OR ".join(keywords) + ")"
 
 
-def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=None):
+def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=None, progress_callback=None):
     query_text = build_theme_query(theme)
     if start_date and end_date:
         next_day = end_date + datetime.timedelta(days=1)
@@ -406,7 +360,8 @@ def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=No
             i = future_to_index[future]
             results[i] = future.result()
             done += 1
-            print(f"  {done}/{total} 件処理しました")
+            if progress_callback:
+                progress_callback(done, total)
 
     articles = [a for a in results if a["summary"]]
     articles = dedupe_articles(articles)
@@ -439,70 +394,221 @@ def send_email(gmail_address, gmail_app_password, to_email, subject, body):
         server.send_message(msg)
 
 
-def main():
+class App(tk.Tk):
+    def __init__(self, gmail_address, gmail_app_password, anthropic_client):
+        super().__init__()
+        self.gmail_address = gmail_address
+        self.gmail_app_password = gmail_app_password
+        self.anthropic_client = anthropic_client
+        self.task_queue = queue.Queue()
+
+        self.title("ニュース収集ツール")
+        self.resizable(False, False)
+        self._build_widgets()
+        self._load_saved_email()
+
+    def _build_widgets(self):
+        pad = {"padx": 10, "pady": 6}
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(row=0, column=0)
+
+        ttk.Label(
+            frame,
+            text="テーマを入力してニュースを収集し、指定したメールアドレスへお届けします。",
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=10, pady=(0, 10))
+
+        ttk.Label(frame, text="受け取り先メールアドレス").grid(row=1, column=0, sticky="w", **pad)
+        self.email_entry = ttk.Entry(frame, width=36)
+        self.email_entry.grid(row=1, column=1, columnspan=2, sticky="we", **pad)
+
+        ttk.Label(frame, text="ニュースのテーマ").grid(row=2, column=0, sticky="w", **pad)
+        self.theme_entry = ttk.Entry(frame, width=36)
+        self.theme_entry.grid(row=2, column=1, columnspan=2, sticky="we", **pad)
+        ttk.Label(
+            frame,
+            text="複数のキーワードをカンマ区切りで入力すると、いずれかを含む記事が対象になります\n"
+            "(例: 飲酒運転,酒酔い,アルコール)",
+            foreground="gray",
+            justify="left",
+        ).grid(row=3, column=1, columnspan=2, sticky="w", padx=10)
+
+        self.date_filter_var = tk.BooleanVar(value=False)
+        self.date_filter_check = ttk.Checkbutton(
+            frame,
+            text="対象日を指定する",
+            variable=self.date_filter_var,
+            command=self._on_date_filter_toggle,
+        )
+        self.date_filter_check.grid(row=4, column=0, columnspan=3, sticky="w", padx=10, pady=(10, 0))
+
+        today = datetime.date.today()
+        ttk.Label(frame, text="開始日").grid(row=5, column=0, sticky="w", **pad)
+        self.start_date_entry = DateEntry(
+            frame, width=16, date_pattern="yyyy/mm/dd", locale="ja_JP", state="disabled", year=today.year,
+            month=today.month, day=today.day,
+        )
+        self.start_date_entry.grid(row=5, column=1, sticky="w", **pad)
+
+        ttk.Label(frame, text="終了日").grid(row=6, column=0, sticky="w", **pad)
+        self.end_date_entry = DateEntry(
+            frame, width=16, date_pattern="yyyy/mm/dd", locale="ja_JP", state="disabled", year=today.year,
+            month=today.month, day=today.day,
+        )
+        self.end_date_entry.grid(row=6, column=1, sticky="w", **pad)
+
+        self.send_button = ttk.Button(frame, text="ニュースを収集してメール送信", command=self._on_submit)
+        self.send_button.grid(row=7, column=0, columnspan=3, pady=(16, 4))
+
+        self.progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
+        self.progress.grid(row=8, column=0, columnspan=3, pady=(4, 4))
+
+        self.status_label = ttk.Label(frame, text="", foreground="gray")
+        self.status_label.grid(row=9, column=0, columnspan=3)
+
+    def _on_date_filter_toggle(self):
+        state = "readonly" if self.date_filter_var.get() else "disabled"
+        self.start_date_entry.configure(state=state)
+        self.end_date_entry.configure(state=state)
+
+    def _load_saved_email(self):
+        if os.path.exists(CONFIG_PATH):
+            load_dotenv(CONFIG_PATH)
+            self.email_entry.insert(0, os.environ.get("TO_EMAIL", ""))
+
+    def _set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        self.email_entry.configure(state=state)
+        self.theme_entry.configure(state=state)
+        self.date_filter_check.configure(state=state)
+        self.send_button.configure(state=state)
+        if busy:
+            self.start_date_entry.configure(state="disabled")
+            self.end_date_entry.configure(state="disabled")
+        else:
+            self._on_date_filter_toggle()
+
+    def _on_submit(self):
+        to_email = self.email_entry.get().strip()
+        theme = self.theme_entry.get().strip()
+
+        if not to_email or "@" not in to_email:
+            messagebox.showerror("入力エラー", "メールアドレスを正しく入力してください。")
+            return
+        if not theme:
+            messagebox.showerror("入力エラー", "ニュースのテーマを入力してください。")
+            return
+
+        start_date = end_date = None
+        if self.date_filter_var.get():
+            start_date = self.start_date_entry.get_date()
+            end_date = self.end_date_entry.get_date()
+            if start_date > end_date:
+                start_date, end_date = end_date, start_date
+
+        self._set_busy(True)
+        self.progress.configure(mode="indeterminate")
+        self.progress.start(12)
+        self.status_label.configure(text="「%s」に関するニュースを検索しています…" % theme)
+
+        threading.Thread(
+            target=self._run_task, args=(to_email, theme, start_date, end_date), daemon=True
+        ).start()
+        self.after(100, self._poll_queue)
+
+    def _run_task(self, to_email, theme, start_date, end_date):
+        def progress_callback(done, total):
+            self.task_queue.put(("progress", done, total))
+
+        try:
+            articles = fetch_news(
+                theme,
+                NEWS_COUNT,
+                start_date=start_date,
+                end_date=end_date,
+                anthropic_client=self.anthropic_client,
+                progress_callback=progress_callback,
+            )
+        except Exception:
+            self.task_queue.put(("error", "処理中にエラーが発生しました。時間をおいて再度お試しください。"))
+            return
+
+        if not articles:
+            self.task_queue.put(("warning", "ニュースが見つかりませんでした。テーマや対象日を変えて試してください。"))
+            return
+
+        if start_date and end_date:
+            if start_date == end_date:
+                date_label = f"({start_date.strftime('%Y/%m/%d')})"
+            else:
+                date_label = f"({start_date.strftime('%Y/%m/%d')}〜{end_date.strftime('%Y/%m/%d')})"
+        else:
+            date_label = ""
+        body = build_email_body(theme, articles, date_label=date_label)
+        subject = f"【ニュース収集】{theme}{date_label} ({len(articles)}件)"
+
+        try:
+            send_email(self.gmail_address, self.gmail_app_password, to_email, subject, body)
+        except smtplib.SMTPAuthenticationError:
+            self.task_queue.put(("error", "メール送信に失敗しました。作成者に連絡してください。"))
+            return
+        except Exception:
+            self.task_queue.put(("error", "メール送信中にエラーが発生しました。時間をおいて再度お試しください。"))
+            return
+
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            f.write(f"TO_EMAIL={to_email}\n")
+
+        self.task_queue.put(("done", f"{len(articles)}件のニュースを {to_email} に送信しました。"))
+
+    def _poll_queue(self):
+        try:
+            while True:
+                message = self.task_queue.get_nowait()
+                kind = message[0]
+                if kind == "progress":
+                    _, done, total = message
+                    if str(self.progress["mode"]) != "determinate":
+                        self.progress.stop()
+                        self.progress.configure(mode="determinate", maximum=total, value=0)
+                    self.progress.configure(value=done)
+                    self.status_label.configure(text=f"記事を確認しています…({done}/{total}件)")
+                else:
+                    self._finish(kind, message[1])
+                    return
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _finish(self, kind, text):
+        self.progress.stop()
+        self.progress.configure(mode="indeterminate", value=0)
+        self.status_label.configure(text="")
+        self._set_busy(False)
+        if kind == "done":
+            messagebox.showinfo("送信完了", text)
+        elif kind == "warning":
+            messagebox.showwarning("ニュースなし", text)
+        else:
+            messagebox.showerror("エラー", text)
+
+
+def launch_gui():
     load_dotenv(SENDER_CONFIG_PATH)
-    gmail_address = os.environ["GMAIL_ADDRESS"]
-    gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
+    try:
+        gmail_address = os.environ["GMAIL_ADDRESS"]
+        gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
+    except KeyError:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("設定エラー", "送信用の設定が見つかりません。作成者に連絡してください。")
+        return
 
     anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
     anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key) if anthropic_api_key else None
 
-    if not os.path.exists(CONFIG_PATH):
-        run_setup_wizard()
-
-    load_dotenv(CONFIG_PATH)
-    to_email = os.environ["TO_EMAIL"]
-
-    theme = input(
-        "収集したいニュースのテーマを入力してください"
-        "(複数のキーワードをカンマ区切りで入力すると、いずれかを含む記事が対象になります。例: 飲酒運転,酒酔い,アルコール): "
-    ).strip()
-    if not theme:
-        print("テーマが入力されていません。")
-        return
-
-    date_input = input(
-        "対象の日付を指定する場合は入力してください"
-        "(例: 2026/7/30、範囲指定は 2026/7/28-2026/7/30、空欄で指定なし): "
-    ).strip()
-    start_date = end_date = None
-    if date_input:
-        start_date, end_date = parse_date_range_input(date_input)
-        if start_date is None:
-            print("日付の形式が正しくありません(例: 2026/7/30 または 2026/7/28-2026/7/30)。日付指定なしで続けます。")
-
-    print(f"「{theme}」に関するニュースを収集中...(記事の要約も取得するため、少し時間がかかります)")
-    articles = fetch_news(
-        theme, NEWS_COUNT, start_date=start_date, end_date=end_date, anthropic_client=anthropic_client
-    )
-
-    if not articles:
-        print("ニュースが見つかりませんでした。")
-        return
-
-    if start_date and end_date:
-        if start_date == end_date:
-            date_label = f"({start_date.strftime('%Y/%m/%d')})"
-        else:
-            date_label = f"({start_date.strftime('%Y/%m/%d')}〜{end_date.strftime('%Y/%m/%d')})"
-    else:
-        date_label = ""
-    body = build_email_body(theme, articles, date_label=date_label)
-    subject = f"【ニュース収集】{theme}{date_label} ({len(articles)}件)"
-
-    try:
-        send_email(gmail_address, gmail_app_password, to_email, subject, body)
-    except smtplib.SMTPAuthenticationError:
-        print()
-        print("メール送信に失敗しました。作成者に連絡してください。")
-        return
-
-    print(f"{len(articles)}件のニュースを {to_email} に送信しました。")
+    App(gmail_address, gmail_app_password, anthropic_client).mainloop()
 
 
 if __name__ == "__main__":
-    main()
-    try:
-        input("終了するには何かキーを押してください...")
-    except EOFError:
-        pass
+    launch_gui()

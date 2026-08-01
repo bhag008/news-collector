@@ -5,12 +5,13 @@
 ## 他の人のPCで使う場合(exe版・Python不要)
 
 1. [Releases](../../releases) から `news-collector.exe` をダウンロードする
-2. `news-collector.exe` をダブルクリックで実行する
-3. 初回のみ、画面の指示に従って**ニュースを届けたいメールアドレス**を入力する
-4. 続けてニュースのテーマ(例: 為替、生成AI)を入力するとメールが届く(AIによる要約取得のため、30件で1〜2分程度かかります)
+2. `news-collector.exe` をダブルクリックで実行すると、ウィンドウが開く
+3. **受け取り先メールアドレス**と**ニュースのテーマ**(例: 為替、生成AI)を入力する
    - 複数キーワードをカンマ区切りで入力すると、いずれかを含む記事が対象になります(例: `飲酒運転,酒酔い,アルコール`)
-5. 2回目以降はテーマの入力だけで使える(設定は`.exe`と同じ場所の`.env`に保存される)
-6. 対象の日付を指定したい場合は、テーマ入力後に日付(例: `2026/7/30`)や範囲(例: `2026/7/28-2026/7/30`)を入力する(空欄で最新のニュースが対象)
+4. 対象の日付を指定したい場合は「対象日を指定する」にチェックを入れ、カレンダーから開始日・終了日を選ぶ(チェックを入れない場合は最新のニュースが対象)
+5. 「ニュースを収集してメール送信」ボタンを押すと収集が始まる(AIによる要約取得のため、30件で1〜2分程度かかります。進捗はウィンドウ内のバーで確認できます)
+6. 完了・記事が見つからなかった場合・送信エラーは、それぞれポップアップで通知される
+7. 2回目以降は、前回入力したメールアドレスが自動で入力された状態で起動する(変更したい場合は書き換えるだけでよい)
 
 要約が取得できなかった記事は結果から除外され、代わりに他の候補記事で件数が補われます。同じ出来事を複数の配信元が報じている場合も、AIが判定して1件にまとめます(候補記事の絶対数が少ないテーマ・期間では、指定件数に満たないことがあります)。
 
@@ -36,7 +37,7 @@ cp sender.env.example sender.env
 | `GMAIL_APP_PASSWORD` | Gmailのアプリパスワード(16桁) |
 | `ANTHROPIC_API_KEY` | Claude API(要約生成用)のAPIキー。[console.anthropic.com](https://console.anthropic.com/)で発行 |
 
-届け先の設定(`.env`)は初回実行時に対話形式で作成されます。手動で作る場合は `.env.example` を参考にしてください。
+届け先メールアドレス(`.env`)は、起動したウィンドウのフォームに入力して送信すると自動的に保存されます。
 
 ```bash
 python main.py
@@ -56,7 +57,7 @@ python main.py
 python -m venv build_env
 ./build_env/Scripts/pip install -r requirements.txt pyinstaller
 
-./build_env/Scripts/pyinstaller --onefile --name news-collector --console \
+./build_env/Scripts/pyinstaller --onefile --name news-collector --windowed \
   --add-data "sender.env;." \
   --add-data "build_env/lib/site-packages/trafilatura/settings.cfg;trafilatura" \
   --add-data "build_env/lib/site-packages/justext/stoplists;justext/stoplists" \
