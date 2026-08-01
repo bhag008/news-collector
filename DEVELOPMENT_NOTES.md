@@ -10,7 +10,7 @@
   AI(Claude Haiku 4.5)で要約したうえでGmail経由でメール送信するデスクトップツール
 - **配布形態**: Python不要のexe単体ファイル(PyInstallerでビルド)。非エンジニアの友人へ配布する想定
 - **リポジトリ**: https://github.com/bhag008/news-collector (public)
-- **最新リリース**: v2.0 (このメモ作成時点)
+- **最新リリース**: v2.1 (このメモ作成時点)
 - **ローカルパス**: `C:\Users\bunbu\OneDrive\デスクトップ\news-collector`
 
 なお、同じ作業ディレクトリ内に別プロジェクト `calculator-app` (Tkinter電卓) もあるが、
@@ -30,6 +30,18 @@
 - 処理中はウィンドウ内にプログレスバー(記事取得中は不定形、母数が判明したら
   `n/total`件の実数表示に切り替え)とステータスラベルを表示する。完了・記事0件・送信失敗などは
   `messagebox`のポップアップで通知する。コンソール画面は表示しない(`--windowed`ビルド)
+- **中止ボタン(送信ボタンの右隣)**: 処理中のみ有効になり、押すと`threading.Event`
+  (`cancel_event`)をsetする。`fetch_news()`はRSS取得直後・記事処理ループの各イテレーション・
+  ループ終了後の3箇所で`cancel_event.is_set()`をチェックし、検知したら未着手のfutureを
+  `future.cancel()`したうえで独自例外`OperationCancelled`を投げる。呼び出し元(`_run_task`)は
+  これを捕まえて`("cancelled", ...)`をqueueに積み、メール送信はスキップする。記事収集が
+  完了しメール送信の直前でも念のため`cancel_event.is_set()`をチェックしており、送信という
+  取り消せない操作の直前まで中止を反映できるようにしている
+  - 実行中のリクエスト(`requests.get`等)自体を強制中断することはできない
+    (Pythonではスレッドの強制終了は安全に行えないため)。`ThreadPoolExecutor`の
+    `with`ブロックを抜ける際に実行中タスクの完了を待つので、中止ボタンを押してから
+    実際に画面が中止完了状態になるまで数秒〜十数秒のタイムラグがあり得る。これは
+    仕様として許容している(即座に強制終了する必要はないというのがユーザーの要望の範囲内)
 - `fetch_news()`は`progress_callback(done, total)`引数を受け取るようになった(以前は`print`で
   直接進捗を出力していた)。GUIはこれを`queue.Queue`経由でメインスレッドに渡し、`after()`で
   ポーリングして描画を更新している(Tkinterはメインスレッド以外からのウィジェット操作が
@@ -122,8 +134,8 @@ git add main.py  # 変更したファイル
 git commit -m "..."
 git push
 
-"/c/Program Files/GitHub CLI/gh.exe" release create v2.0 "dist/news-collector.exe" \
-  --title "v2.0" --notes "変更内容の説明"
+"/c/Program Files/GitHub CLI/gh.exe" release create v2.1 "dist/news-collector.exe" \
+  --title "v2.1" --notes "変更内容の説明"
 ```
 
 `gh`コマンドはこのBash/PowerShellセッションのPATHに乗っていない(セッション開始後に
@@ -143,10 +155,12 @@ wingetでインストールしたため)。フルパス`/c/Program Files/GitHub 
 - **Claude Codeのこの実行環境からは、ネイティブWindowウィンドウ(Tkinterアプリ含む)への
   マウスクリックの自動シミュレーションが届かない。** `SetCursorPos`/`mouse_event`で座標を
   指定してもクリックが別のウィンドウ(Claude Codeのデスクトップアプリ自身など)に吸われる。
-  スクリーンショットでの見た目確認はできるが、チェックボックスやボタンの実際のクリック動作は
-  自動検証できないため、GUIの対話フロー(チェックボックス切り替え、日付選択、送信ボタン等)は
-  ユーザー本人による実機での動作確認が必要。ロジック部分(`fetch_news`など)は
-  GUIを介さず直接Pythonから呼び出してテスト可能
+  さらにスクリーンショット(`CopyFromScreen`)も不安定で、初回は正しく撮れても、同じ
+  ウィンドウを`ShowWindow`/`SetForegroundWindow`後に撮り直すとChat画面側が写ってしまう
+  ことがあり、`PrintWindow` APIに切り替えてもウィンドウハンドルの取得自体が不安定だった。
+  そのため、GUIの対話フロー(チェックボックス切り替え、日付選択、送信ボタン・中止ボタン等)は
+  自動検証をあてにせず、ユーザー本人による実機での動作確認が必要という前提で進めること。
+  ロジック部分(`fetch_news`など)はGUIを介さず直接Pythonから呼び出してテスト可能
 
 ## バージョン履歴の概要
 
@@ -158,6 +172,7 @@ wingetでインストールしたため)。フルパス`/c/Program Files/GitHub 
 - v1.7: 「NO_SUMMARY」が本文に混入するバグ修正、文体を「だ・である調」に統一
 - v1.8: AIによる重複記事の除外(媒体をまたいだ同一事件の統合)、カンマ区切りOR検索
 - v2.0: CLIからTkinter GUIへ移行(カレンダーからの日付選択、プログレスバー、ポップアップ通知)
+- v2.1: 収集中に中止できる「中止」ボタンを追加(`cancel_event`/`OperationCancelled`によるキャンセル伝播)
 
 ## 未対応・今後の検討事項(明示的な依頼はまだないが会話中に触れたもの)
 
@@ -171,9 +186,11 @@ CLI(ターミナル入力)からTkinter GUIへの移行(v2.0)を実施した。`
 (`run_setup_wizard`、`input()`によるテーマ・日付入力、`print`による進捗表示)を撤去し、
 `App(tk.Tk)`クラスによるフォーム画面に置き換えた。`fetch_news()`に`progress_callback`引数を
 追加し、業務ロジック関数(`fetch_news`/`send_email`/`build_email_body`等)自体は変更していない。
-`--windowed`でビルドし直し、GUIが起動して正しく描画されることをスクリーンショットで確認、
-`fetch_news`をGUIを介さず直接呼び出して収集ロジックが壊れていないことも確認済み。
-実行環境の制約でGUI上のクリック操作(チェックボックス切り替え・カレンダー選択・送信ボタン
-押下)はClaude側では自動検証できなかったため、ユーザー(bhag008)本人が実機の
-`dist/news-collector.exe`を実際にクリックして動作確認し、「問題ありません」と確認済み。
-これを受けて大規模アップデートとして v2.0 でリリースした。
+ユーザー(bhag008)本人が実機の`dist/news-collector.exe`をクリックして動作確認し、
+「問題ありません」と確認。大規模アップデートとして v2.0 でリリース済み(コミット`eef6134`)。
+
+その後、「実行中に中止するための機能が欲しい」との依頼で中止ボタンを追加した(上記UI形式
+セクション参照)。`OperationCancelled`例外・`cancel_event`によるキャンセル伝播のロジックは
+Pythonから直接`fetch_news`を呼び出して動作確認済み(進捗2件時点でキャンセルし、正しく
+`OperationCancelled`が送出されることを確認)。ユーザー本人が実機で中止ボタンの動作を確認し
+「問題ありません」と確認。v2.1としてリリース済み。

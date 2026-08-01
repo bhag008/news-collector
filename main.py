@@ -20,6 +20,10 @@ import trafilatura
 from dotenv import load_dotenv
 from tkcalendar import DateEntry
 
+class OperationCancelled(Exception):
+    pass
+
+
 NEWS_COUNT = 30
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 5
@@ -325,7 +329,9 @@ def build_theme_query(theme):
     return "(" + " OR ".join(keywords) + ")"
 
 
-def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=None, progress_callback=None):
+def fetch_news(
+    theme, count, start_date=None, end_date=None, anthropic_client=None, progress_callback=None, cancel_event=None
+):
     query_text = build_theme_query(theme)
     if start_date and end_date:
         next_day = end_date + datetime.timedelta(days=1)
@@ -334,6 +340,9 @@ def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=No
     query = urllib.parse.quote(query_text)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
     feed = feedparser.parse(feed_url)
+
+    if cancel_event and cancel_event.is_set():
+        raise OperationCancelled
 
     entries = feed.entries
     if start_date and end_date:
@@ -356,14 +365,23 @@ def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=No
             for i, e in enumerate(candidate_entries)
         }
         done = 0
+        cancelled = False
         for future in as_completed(future_to_index):
+            if cancel_event and cancel_event.is_set():
+                for f in future_to_index:
+                    f.cancel()
+                cancelled = True
+                break
             i = future_to_index[future]
             results[i] = future.result()
             done += 1
             if progress_callback:
                 progress_callback(done, total)
 
-    articles = [a for a in results if a["summary"]]
+    if cancelled:
+        raise OperationCancelled
+
+    articles = [a for a in results if a and a["summary"]]
     articles = dedupe_articles(articles)
     return articles[:count]
 
@@ -401,6 +419,7 @@ class App(tk.Tk):
         self.gmail_app_password = gmail_app_password
         self.anthropic_client = anthropic_client
         self.task_queue = queue.Queue()
+        self.cancel_event = None
 
         self.title("ニュース収集ツール")
         self.resizable(False, False)
@@ -457,8 +476,12 @@ class App(tk.Tk):
         )
         self.end_date_entry.grid(row=6, column=1, sticky="w", **pad)
 
-        self.send_button = ttk.Button(frame, text="ニュースを収集してメール送信", command=self._on_submit)
-        self.send_button.grid(row=7, column=0, columnspan=3, pady=(16, 4))
+        button_frame = ttk.Frame(frame)
+        button_frame.grid(row=7, column=0, columnspan=3, pady=(16, 4))
+        self.send_button = ttk.Button(button_frame, text="ニュースを収集してメール送信", command=self._on_submit)
+        self.send_button.pack(side="left", padx=(0, 8))
+        self.cancel_button = ttk.Button(button_frame, text="中止", command=self._on_cancel, state="disabled")
+        self.cancel_button.pack(side="left")
 
         self.progress = ttk.Progressbar(frame, mode="indeterminate", length=320)
         self.progress.grid(row=8, column=0, columnspan=3, pady=(4, 4))
@@ -482,11 +505,18 @@ class App(tk.Tk):
         self.theme_entry.configure(state=state)
         self.date_filter_check.configure(state=state)
         self.send_button.configure(state=state)
+        self.cancel_button.configure(state=("normal" if busy else "disabled"))
         if busy:
             self.start_date_entry.configure(state="disabled")
             self.end_date_entry.configure(state="disabled")
         else:
             self._on_date_filter_toggle()
+
+    def _on_cancel(self):
+        if self.cancel_event:
+            self.cancel_event.set()
+        self.cancel_button.configure(state="disabled")
+        self.status_label.configure(text="中止しています…")
 
     def _on_submit(self):
         to_email = self.email_entry.get().strip()
@@ -506,17 +536,18 @@ class App(tk.Tk):
             if start_date > end_date:
                 start_date, end_date = end_date, start_date
 
+        self.cancel_event = threading.Event()
         self._set_busy(True)
         self.progress.configure(mode="indeterminate")
         self.progress.start(12)
         self.status_label.configure(text="「%s」に関するニュースを検索しています…" % theme)
 
         threading.Thread(
-            target=self._run_task, args=(to_email, theme, start_date, end_date), daemon=True
+            target=self._run_task, args=(to_email, theme, start_date, end_date, self.cancel_event), daemon=True
         ).start()
         self.after(100, self._poll_queue)
 
-    def _run_task(self, to_email, theme, start_date, end_date):
+    def _run_task(self, to_email, theme, start_date, end_date, cancel_event):
         def progress_callback(done, total):
             self.task_queue.put(("progress", done, total))
 
@@ -528,13 +559,21 @@ class App(tk.Tk):
                 end_date=end_date,
                 anthropic_client=self.anthropic_client,
                 progress_callback=progress_callback,
+                cancel_event=cancel_event,
             )
+        except OperationCancelled:
+            self.task_queue.put(("cancelled", "処理を中止しました。"))
+            return
         except Exception:
             self.task_queue.put(("error", "処理中にエラーが発生しました。時間をおいて再度お試しください。"))
             return
 
         if not articles:
             self.task_queue.put(("warning", "ニュースが見つかりませんでした。テーマや対象日を変えて試してください。"))
+            return
+
+        if cancel_event.is_set():
+            self.task_queue.put(("cancelled", "処理を中止しました。"))
             return
 
         if start_date and end_date:
@@ -589,6 +628,8 @@ class App(tk.Tk):
             messagebox.showinfo("送信完了", text)
         elif kind == "warning":
             messagebox.showwarning("ニュースなし", text)
+        elif kind == "cancelled":
+            messagebox.showinfo("中止しました", text)
         else:
             messagebox.showerror("エラー", text)
 
