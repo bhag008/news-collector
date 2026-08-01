@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from email.mime.text import MIMEText
 from urllib.parse import quote, urlparse
 
+import anthropic
 import feedparser
 import requests
 import trafilatura
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 NEWS_COUNT = 30
 REQUEST_TIMEOUT = 10
 MAX_WORKERS = 5
+ANTHROPIC_MODEL = "claude-haiku-4-5"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
@@ -129,6 +131,36 @@ def summarize_text(text, max_sentences=3, max_chars=300):
     return summary or None
 
 
+def summarize_with_ai(anthropic_client, text, max_chars=300):
+    prompt = (
+        "以下は、ニュースサイトのページから自動的に抽出したテキストです。"
+        "まずこれが実際のニュース記事の本文かどうかを判断してください。\n"
+        "記事本文であれば、記事全体の要点を150〜250文字程度の日本語で要約してください。"
+        "出力は要約文のみとし、それ以外の文章"
+        "(例:「これは記事の本文です」「以下が要約です」といった前置きや説明、見出し)は一切含めないでください。\n"
+        "記事本文ではなく、会員登録案内・エラーメッセージ・広告・ナビゲーションメニューなど"
+        "記事以外の内容だった場合は、他には何も書かず「NO_SUMMARY」とだけ出力してください。\n\n"
+        + text[:4000]
+    )
+    response = anthropic_client.messages.create(
+        model=ANTHROPIC_MODEL,
+        max_tokens=400,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    summary = "".join(block.text for block in response.content if block.type == "text").strip()
+    if not summary or summary.startswith("NO_SUMMARY"):
+        return None
+
+    if "\n\n" in summary:
+        head, _, rest = summary.partition("\n\n")
+        if len(head) < 60 and any(k in head for k in ("要約", "本文です", "以下")):
+            summary = rest.strip()
+
+    if len(summary) > max_chars:
+        summary = summary[:max_chars].rstrip() + "…"
+    return summary
+
+
 BOILERPLATE_MARKERS = [
     "RECOMMEND",
     "あなたにおすすめ",
@@ -155,6 +187,9 @@ PAYWALL_MARKERS = [
     "続きを読むには",
     "ログインが必要です",
     "この記事は会員向け",
+    "コンテンツブロックが有効",
+    "広告ブロック機能",
+    "アドブロックが有効",
 ]
 
 
@@ -171,7 +206,7 @@ def _looks_paywalled(text, search_chars=1000):
     return any(marker in head for marker in PAYWALL_MARKERS)
 
 
-def extract_summary(article_url, max_sentences=3, max_chars=300):
+def extract_summary(article_url, anthropic_client=None, max_sentences=3, max_chars=300):
     try:
         resp = requests.get(article_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
         resp.raise_for_status()
@@ -188,6 +223,12 @@ def extract_summary(article_url, max_sentences=3, max_chars=300):
     text = _strip_boilerplate(text)
     if not text.strip():
         return None
+
+    if anthropic_client:
+        try:
+            return summarize_with_ai(anthropic_client, text, max_chars=max_chars)
+        except Exception:
+            return None  # AI summarization failed -> treat as "content not understood"
 
     return summarize_text(text, max_sentences=max_sentences, max_chars=max_chars)
 
@@ -239,9 +280,9 @@ def _entry_jst_date(entry):
     return (utc_dt + datetime.timedelta(hours=9)).date()
 
 
-def process_entry(entry):
+def process_entry(entry, anthropic_client=None):
     article_url = resolve_article_url(entry.link)
-    summary = extract_summary(article_url)
+    summary = extract_summary(article_url, anthropic_client=anthropic_client)
     return {
         "title": entry.title,
         "date": format_date(entry),
@@ -251,7 +292,7 @@ def process_entry(entry):
     }
 
 
-def fetch_news(theme, count, start_date=None, end_date=None):
+def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=None):
     query_text = theme
     if start_date and end_date:
         next_day = end_date + datetime.timedelta(days=1)
@@ -269,22 +310,27 @@ def fetch_news(theme, count, start_date=None, end_date=None):
             if entry_date and start_date <= entry_date <= end_date:
                 filtered.append(e)
         entries = filtered
-    entries = entries[:count]
-    total = len(entries)
+
+    candidate_entries = entries[: count * 3]
+    total = len(candidate_entries)
     if total == 0:
         return []
 
-    articles = [None] * total
+    results = [None] * total
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_index = {executor.submit(process_entry, e): i for i, e in enumerate(entries)}
+        future_to_index = {
+            executor.submit(process_entry, e, anthropic_client): i
+            for i, e in enumerate(candidate_entries)
+        }
         done = 0
         for future in as_completed(future_to_index):
             i = future_to_index[future]
-            articles[i] = future.result()
+            results[i] = future.result()
             done += 1
             print(f"  {done}/{total} 件処理しました")
 
-    return articles
+    articles = [a for a in results if a["summary"]]
+    return articles[:count]
 
 
 def build_email_body(theme, articles, date_label=""):
@@ -318,6 +364,9 @@ def main():
     gmail_address = os.environ["GMAIL_ADDRESS"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
 
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+    anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key) if anthropic_api_key else None
+
     if not os.path.exists(CONFIG_PATH):
         run_setup_wizard()
 
@@ -340,7 +389,9 @@ def main():
             print("日付の形式が正しくありません(例: 2026/7/30 または 2026/7/28-2026/7/30)。日付指定なしで続けます。")
 
     print(f"「{theme}」に関するニュースを収集中...(記事の要約も取得するため、少し時間がかかります)")
-    articles = fetch_news(theme, NEWS_COUNT, start_date=start_date, end_date=end_date)
+    articles = fetch_news(
+        theme, NEWS_COUNT, start_date=start_date, end_date=end_date, anthropic_client=anthropic_client
+    )
 
     if not articles:
         print("ニュースが見つかりませんでした。")
