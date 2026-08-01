@@ -135,9 +135,13 @@ def summarize_with_ai(anthropic_client, text, max_chars=300):
     prompt = (
         "以下は、ニュースサイトのページから自動的に抽出したテキストです。"
         "まずこれが実際のニュース記事の本文かどうかを判断してください。\n"
-        "記事本文であれば、記事全体の要点を150〜250文字程度の日本語で要約してください。"
-        "文体は「だ・である調」で統一し、「です・ます調」は使わないでください。"
-        "出力は要約文のみとし、それ以外の文章"
+        "記事本文であれば、次の2つを出力してください。\n"
+        "1. 記事全体の要点を150〜250文字程度の日本語で要約する。"
+        "文体は「だ・である調」で統一し、「です・ます調」は使わない。\n"
+        "2. 区切り記号「###」に続けて、この記事が伝えている具体的な出来事を表す短いキーワード"
+        "(いつ・どこで・誰が・何をしたか、を含めて20〜40文字程度)を出力する。"
+        "同じ出来事を別の配信元が報じた記事であれば、同じような表現になるようにする。\n"
+        "出力は要約文と、それに続く「###キーワード」の2つだけとし、それ以外の文章"
         "(例:「これは記事の本文です」「以下が要約です」といった前置きや説明、見出し)は一切含めないでください。\n"
         "記事本文ではなく、会員登録案内・エラーメッセージ・広告・ナビゲーションメニューなど"
         "記事以外の内容だった場合は、他には何も書かず「NO_SUMMARY」とだけ出力してください。\n\n"
@@ -148,9 +152,17 @@ def summarize_with_ai(anthropic_client, text, max_chars=300):
         max_tokens=400,
         messages=[{"role": "user", "content": prompt}],
     )
-    summary = "".join(block.text for block in response.content if block.type == "text").strip()
-    if not summary or "NO_SUMMARY" in summary:
-        return None
+    raw = "".join(block.text for block in response.content if block.type == "text").strip()
+    if not raw or "NO_SUMMARY" in raw:
+        return None, None
+
+    if "###" in raw:
+        summary, _, event_key = raw.partition("###")
+        summary = summary.strip()
+        event_key = event_key.strip() or None
+    else:
+        summary = raw
+        event_key = None
 
     if "\n\n" in summary:
         head, _, rest = summary.partition("\n\n")
@@ -159,7 +171,7 @@ def summarize_with_ai(anthropic_client, text, max_chars=300):
 
     if len(summary) > max_chars:
         summary = summary[:max_chars].rstrip() + "…"
-    return summary
+    return summary, event_key
 
 
 BOILERPLATE_MARKERS = [
@@ -212,26 +224,26 @@ def extract_summary(article_url, anthropic_client=None, max_sentences=3, max_cha
         resp = requests.get(article_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
         resp.raise_for_status()
     except requests.exceptions.RequestException:
-        return None
+        return None, None
 
     text = trafilatura.extract(resp.content, url=article_url)
     if not text:
-        return None
+        return None, None
 
     if _looks_paywalled(text):
-        return None
+        return None, None
 
     text = _strip_boilerplate(text)
     if not text.strip():
-        return None
+        return None, None
 
     if anthropic_client:
         try:
             return summarize_with_ai(anthropic_client, text, max_chars=max_chars)
         except Exception:
-            return None  # AI summarization failed -> treat as "content not understood"
+            return None, None  # AI summarization failed -> treat as "content not understood"
 
-    return summarize_text(text, max_sentences=max_sentences, max_chars=max_chars)
+    return summarize_text(text, max_sentences=max_sentences, max_chars=max_chars), None
 
 
 def format_date(entry):
@@ -281,23 +293,89 @@ def _entry_jst_date(entry):
     return (utc_dt + datetime.timedelta(hours=9)).date()
 
 
+def _normalize_title_for_dedup(title):
+    for sep in (" - ", " | "):
+        idx = title.rfind(sep)
+        if idx != -1:
+            title = title[:idx]
+    return title.strip()
+
+
+def _normalize_url_for_dedup(url):
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    for suffix in ("/images/000", "/images"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+    return f"{parsed.netloc}{path}"
+
+
+def _char_bigrams(text):
+    text = re.sub(r"\s+", "", text)
+    if len(text) < 2:
+        return {text} if text else set()
+    return {text[i : i + 2] for i in range(len(text) - 1)}
+
+
+def _title_similarity(a, b):
+    set_a, set_b = _char_bigrams(a), _char_bigrams(b)
+    if not set_a or not set_b:
+        return 0.0
+    intersection = len(set_a & set_b)
+    union = len(set_a | set_b)
+    return intersection / union if union else 0.0
+
+
+TITLE_SIMILARITY_THRESHOLD = 0.2
+
+
+def dedupe_articles(articles):
+    seen_urls = set()
+    seen_titles = set()
+    kept_compare_keys = []
+    deduped = []
+    for article in articles:
+        url_key = _normalize_url_for_dedup(article["url"])
+        title_key = _normalize_title_for_dedup(article["title"])
+        compare_key = article.get("event_key") or title_key
+
+        if url_key in seen_urls or title_key in seen_titles:
+            continue
+        if any(_title_similarity(compare_key, kept) >= TITLE_SIMILARITY_THRESHOLD for kept in kept_compare_keys):
+            continue
+
+        seen_urls.add(url_key)
+        seen_titles.add(title_key)
+        kept_compare_keys.append(compare_key)
+        deduped.append(article)
+    return deduped
+
+
 def process_entry(entry, anthropic_client=None):
     article_url = resolve_article_url(entry.link)
-    summary = extract_summary(article_url, anthropic_client=anthropic_client)
+    summary, event_key = extract_summary(article_url, anthropic_client=anthropic_client)
     return {
         "title": entry.title,
         "date": format_date(entry),
         "source": entry.get("source", {}).get("title", ""),
         "summary": summary,
+        "event_key": event_key,
         "url": article_url,
     }
 
 
+def build_theme_query(theme):
+    keywords = [k.strip() for k in re.split(r"[,、]", theme) if k.strip()]
+    if len(keywords) <= 1:
+        return theme
+    return "(" + " OR ".join(keywords) + ")"
+
+
 def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=None):
-    query_text = theme
+    query_text = build_theme_query(theme)
     if start_date and end_date:
         next_day = end_date + datetime.timedelta(days=1)
-        query_text = f"{theme} after:{start_date.isoformat()} before:{next_day.isoformat()}"
+        query_text = f"{query_text} after:{start_date.isoformat()} before:{next_day.isoformat()}"
 
     query = urllib.parse.quote(query_text)
     feed_url = f"https://news.google.com/rss/search?q={query}&hl=ja&gl=JP&ceid=JP:ja"
@@ -331,6 +409,7 @@ def fetch_news(theme, count, start_date=None, end_date=None, anthropic_client=No
             print(f"  {done}/{total} 件処理しました")
 
     articles = [a for a in results if a["summary"]]
+    articles = dedupe_articles(articles)
     return articles[:count]
 
 
@@ -374,7 +453,10 @@ def main():
     load_dotenv(CONFIG_PATH)
     to_email = os.environ["TO_EMAIL"]
 
-    theme = input("収集したいニュースのテーマを入力してください: ").strip()
+    theme = input(
+        "収集したいニュースのテーマを入力してください"
+        "(複数のキーワードをカンマ区切りで入力すると、いずれかを含む記事が対象になります。例: 飲酒運転,酒酔い,アルコール): "
+    ).strip()
     if not theme:
         print("テーマが入力されていません。")
         return
