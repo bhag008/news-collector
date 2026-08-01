@@ -136,6 +136,7 @@ def summarize_with_ai(anthropic_client, text, max_chars=300):
         "以下は、ニュースサイトのページから自動的に抽出したテキストです。"
         "まずこれが実際のニュース記事の本文かどうかを判断してください。\n"
         "記事本文であれば、記事全体の要点を150〜250文字程度の日本語で要約してください。"
+        "文体は「だ・である調」で統一し、「です・ます調」は使わないでください。"
         "出力は要約文のみとし、それ以外の文章"
         "(例:「これは記事の本文です」「以下が要約です」といった前置きや説明、見出し)は一切含めないでください。\n"
         "記事本文ではなく、会員登録案内・エラーメッセージ・広告・ナビゲーションメニューなど"
@@ -148,7 +149,7 @@ def summarize_with_ai(anthropic_client, text, max_chars=300):
         messages=[{"role": "user", "content": prompt}],
     )
     summary = "".join(block.text for block in response.content if block.type == "text").strip()
-    if not summary or summary.startswith("NO_SUMMARY"):
+    if not summary or "NO_SUMMARY" in summary:
         return None
 
     if "\n\n" in summary:
