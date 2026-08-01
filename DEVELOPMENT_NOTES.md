@@ -10,7 +10,7 @@
   AI(Claude Haiku 4.5)で要約したうえでGmail経由でメール送信するデスクトップツール
 - **配布形態**: Python不要のexe単体ファイル(PyInstallerでビルド)。非エンジニアの友人へ配布する想定
 - **リポジトリ**: https://github.com/bhag008/news-collector (public)
-- **最新リリース**: v2.1 (このメモ作成時点)
+- **最新リリース**: v2.2 (このメモ作成時点)
 - **ローカルパス**: `C:\Users\bunbu\OneDrive\デスクトップ\news-collector`
 
 なお、同じ作業ディレクトリ内に別プロジェクト `calculator-app` (Tkinter電卓) もあるが、
@@ -27,6 +27,9 @@
 - 対象日はフリーテキスト入力(`2026/7/30`のような書式)をやめ、`tkcalendar`のカレンダーピッカーに
   変更した。非技術者には書式を覚えさせるより選ばせる方が分かりやすいため。これに伴い
   `parse_date_input`/`parse_date_range_input`は不要になり削除した
+- `DateEntry`は`showweeknumbers=False`を指定している。デフォルトでは左端にISO週番号
+  (32、33など)が表示されるが、非技術者には「変な数値」にしか見えず紛らわしいと
+  フィードバックがあったため非表示にした(v2.2)
 - 処理中はウィンドウ内にプログレスバー(記事取得中は不定形、母数が判明したら
   `n/total`件の実数表示に切り替え)とステータスラベルを表示する。完了・記事0件・送信失敗などは
   `messagebox`のポップアップで通知する。コンソール画面は表示しない(`--windowed`ビルド)
@@ -134,8 +137,8 @@ git add main.py  # 変更したファイル
 git commit -m "..."
 git push
 
-"/c/Program Files/GitHub CLI/gh.exe" release create v2.1 "dist/news-collector.exe" \
-  --title "v2.1" --notes "変更内容の説明"
+"/c/Program Files/GitHub CLI/gh.exe" release create v2.2 "dist/news-collector.exe" \
+  --title "v2.2" --notes "変更内容の説明"
 ```
 
 `gh`コマンドはこのBash/PowerShellセッションのPATHに乗っていない(セッション開始後に
@@ -173,6 +176,7 @@ wingetでインストールしたため)。フルパス`/c/Program Files/GitHub 
 - v1.8: AIによる重複記事の除外(媒体をまたいだ同一事件の統合)、カンマ区切りOR検索
 - v2.0: CLIからTkinter GUIへ移行(カレンダーからの日付選択、プログレスバー、ポップアップ通知)
 - v2.1: 収集中に中止できる「中止」ボタンを追加(`cancel_event`/`OperationCancelled`によるキャンセル伝播)
+- v2.2: カレンダーピッカーの週番号表示を廃止(`showweeknumbers=False`)
 
 ## 未対応・今後の検討事項(明示的な依頼はまだないが会話中に触れたもの)
 
@@ -194,3 +198,8 @@ CLI(ターミナル入力)からTkinter GUIへの移行(v2.0)を実施した。`
 Pythonから直接`fetch_news`を呼び出して動作確認済み(進捗2件時点でキャンセルし、正しく
 `OperationCancelled`が送出されることを確認)。ユーザー本人が実機で中止ボタンの動作を確認し
 「問題ありません」と確認。v2.1としてリリース済み。
+
+続けて、友人への配布方法(GitHub Releasesのリンクを送る案内文)を作成した後、ユーザーから
+カレンダーの左端に表示される週番号(32、33など)のスクリーンショットが送られ、「変な数値」を
+なくしたいとの依頼を受けた。`DateEntry`に`showweeknumbers=False`を追加して非表示にし、
+ユーザーが実機で確認して「問題ありません」。v2.2としてリリース済み。

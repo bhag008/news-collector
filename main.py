@@ -465,14 +465,14 @@ class App(tk.Tk):
         ttk.Label(frame, text="開始日").grid(row=5, column=0, sticky="w", **pad)
         self.start_date_entry = DateEntry(
             frame, width=16, date_pattern="yyyy/mm/dd", locale="ja_JP", state="disabled", year=today.year,
-            month=today.month, day=today.day,
+            month=today.month, day=today.day, showweeknumbers=False,
         )
         self.start_date_entry.grid(row=5, column=1, sticky="w", **pad)
 
         ttk.Label(frame, text="終了日").grid(row=6, column=0, sticky="w", **pad)
         self.end_date_entry = DateEntry(
             frame, width=16, date_pattern="yyyy/mm/dd", locale="ja_JP", state="disabled", year=today.year,
-            month=today.month, day=today.day,
+            month=today.month, day=today.day, showweeknumbers=False,
         )
         self.end_date_entry.grid(row=6, column=1, sticky="w", **pad)
 
